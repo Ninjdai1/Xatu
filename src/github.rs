@@ -253,11 +253,11 @@ impl GithubData {
         ));
         md.push_str(&format!(
                 "**Closed Issues**: [{py}]({ISSUE_CLOSED}{CLOSED_STRING}{yesterday_date_span}) | [{p7}]({ISSUE_CLOSED}{CLOSED_STRING}{last_7_days_date_span}) | [{p30}]({ISSUE_CLOSED}{CLOSED_STRING}{last_30_days_date_span}) | [{p365}]({ISSUE_CLOSED}{CLOSED_STRING}{last_365_days_date_span}) | [{pa}]({ISSUE_CLOSED})\n\n",
-            py=self.yesterday.opened_issues,
-            p7=self.last_week.opened_issues,
-            p30=self.last_month.opened_issues,
-            p365=self.last_year.opened_issues,
-            pa=self.all.opened_issues
+            py=self.yesterday.closed_issues,
+            p7=self.last_week.closed_issues,
+            p30=self.last_month.closed_issues,
+            p365=self.last_year.closed_issues,
+            pa=self.all.closed_issues
         ));
 
         md.push_str(&format!("**Resolution Rate**: {:.2} | {:.2} | {:.2} | {:.2} | {:.2}\n\n",
