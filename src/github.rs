@@ -3,15 +3,37 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, NaiveDate, Utc};
 use octocrab::models::{self, issues::Issue, pulls::PullRequest, IssueState, Label};
 
+use crate::utils::format_timestamp_since;
+
+static CREATED_STRING: &str = "+created%3A";
+static MERGED_STRING: &str = "+merged%3A";
+static CLOSED_STRING: &str = "+closed%3A";
+static ISSUE_URL: &str = "https://github.com/rh-hideout/pokeemerald-expansion/issues";
+static PRS_URL: &str = "https://github.com/rh-hideout/pokeemerald-expansion/pulls";
+static PR_URL: &str = "https://github.com/rh-hideout/pokeemerald-expansion/pull";
+static PR_OPENED: &str = "https://github.com/rh-hideout/pokeemerald-expansion/pulls?q=is%3Apr+sort%3Aupdated-asc";
+static PR_MERGED: &str = "https://github.com/rh-hideout/pokeemerald-expansion/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-asc+draft%3Afalse";
+static ISSUE_OPENED: &str = "https://github.com/rh-hideout/pokeemerald-expansion/issues?q=is%253Aissue+sort%3Aupdated-asc";
+static ISSUE_CLOSED: &str = "https://github.com/rh-hideout/pokeemerald-expansion/issues?q=is%253Aissue+is%253Aclosed+sort%3Aupdated-asc";
+
 #[derive(Clone, Debug)]
 struct ParsedIssue {
     user: String,
+    id: u64,
     title: String,
     state: IssueState,
     creation_date: DateTime<Utc>,
     updated_date: DateTime<Utc>,
     closed_date: Option<DateTime<Utc>>,
     labels: Vec<Label>
+}
+
+impl ParsedIssue {
+    fn list_render(&self, is_pr: bool) -> String {
+        format!("* [#{iu} - {it}]({url}/{iu}) | {id}\n",
+            it=self.title, url=if is_pr {ISSUE_URL} else {PR_URL}, iu=self.id,
+            id=format_timestamp_since(self.updated_date.timestamp().unsigned_abs()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,9 +49,10 @@ impl Default for PRState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ParsedPR {
     user: String,
+    id: u64,
     title: String,
     state: PRState,
     open_state: IssueState,
@@ -39,7 +62,15 @@ struct ParsedPR {
     labels: Vec<Label>
 }
 
-#[derive(Copy, Clone, Debug)]
+impl ParsedPR {
+    fn list_render(&self) -> String {
+        format!("* [#{iu} - {it}]({PR_URL}/{iu}) | {id}\n",
+            it=self.title, iu=self.id,
+            id=format_timestamp_since(self.updated_date.timestamp().unsigned_abs()))
+    }
+}
+
+#[derive(Debug, Clone)]
 struct TimedStats {
     date: Option<NaiveDate>,
     opened_prs: usize,
@@ -51,8 +82,8 @@ struct TimedStats {
 }
 
 impl Default for TimedStats {
-    fn default() -> Self {
-        Self { date: Some(chrono::offset::Utc::now().date_naive()), opened_prs: 0, merged_prs: 0, cancelled_prs: 0, opened_issues: 0, closed_issues: 0 }
+    fn default() -> TimedStats {
+        TimedStats { date: Some(chrono::offset::Utc::now().date_naive()), opened_prs: 0, merged_prs: 0, cancelled_prs: 0, opened_issues: 0, closed_issues: 0 }
     }
 }
 
@@ -91,7 +122,7 @@ impl TimedStats {
     }
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Default, Debug)]
 pub struct GithubData {
     date: DateTime<Utc>,
     open_issues: usize,
@@ -105,6 +136,9 @@ pub struct GithubData {
 
     stale_issues: Vec<ParsedIssue>,
     stale_pull_requests: Vec<ParsedPR>,
+
+    most_recent_issues: Vec<ParsedIssue>,
+    most_recent_pull_requests: Vec<ParsedPR>,
 
     yesterday: TimedStats,
     last_week: TimedStats,
@@ -139,6 +173,7 @@ impl GithubData {
             .issues("rh-hideout", "pokeemerald-expansion")
             .list()
             .state(octocrab::params::State::All)
+            .sort(octocrab::params::issues::Sort::Updated)
             .per_page(100)
             .send()
             .await.unwrap();
@@ -159,6 +194,7 @@ impl GithubData {
             .pulls("rh-hideout", "pokeemerald-expansion")
             .list()
             .state(octocrab::params::State::All)
+            .sort(octocrab::params::pulls::Sort::Updated)
             .per_page(100)
             .send()
             .await.unwrap();
@@ -192,19 +228,73 @@ impl GithubData {
         self.last_year = TimedStats::since_date(last_365_days, &mut issues, &mut pull_requests);
         self.all = TimedStats::all_time(&mut issues, &mut pull_requests);
 
-        let test = octocrab::instance().ratelimit().get().await.unwrap();
+        let stale_issues = octocrab
+            .search()
+            .issues_and_pull_requests(&"repo:rh-hideout/pokeemerald-expansion is:open sort:updated-asc label:bug is:issue")
+            .per_page(3)
+            .send().await.unwrap();
+        for issue in &stale_issues {
+            self.stale_issues.push(parse_issue(issue.clone()));
+        }
+        let stale_pull_requests = octocrab
+            .search().issues_and_pull_requests(&"repo:rh-hideout/pokeemerald-expansion is:open sort:updated-asc draft:false is:pr")
+            .per_page(3)
+            .send().await.unwrap();
+        for pr in &stale_pull_requests {
+            self.stale_pull_requests.push(parse_pr_from_issue(pr.clone()));
+        }
 
-        println!("Rate limit: {:#?}", test.resources.core);
+        let most_recent_issues = octocrab
+            .search().issues_and_pull_requests(&"repo:rh-hideout/pokeemerald-expansion is:open sort:created-desc is:issue")
+            .per_page(3)
+            .send().await.unwrap();
+        for issue in most_recent_issues {
+            self.most_recent_issues.push(parse_issue(issue));
+        }
+        let most_recent_pull_requests = octocrab
+            .search().issues_and_pull_requests(&"repo:rh-hideout/pokeemerald-expansion is:open sort:created-desc is:pr")
+            .per_page(3)
+            .send().await.unwrap();
+        for pr in most_recent_pull_requests {
+            self.most_recent_pull_requests.push(parse_pr_from_issue(pr));
+        }
+
+        let test = octocrab.ratelimit().get().await.unwrap();
+
+        println!("Rate limit: {:#?}\n{:#?}", test.resources.core, test.resources.search);
         println!("Resets in {:#?} minutes", (test.resources.core.reset - SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs())/60);
     }
 
     pub fn render(&self) -> String {
         println!("{:#?}", self);
-        let mut md = String::from("# Raw Stats\n\n");
-        md.push_str(&format!("{} open issues ({} confirmed / {} unconfirmed / {} feature requests)\n\n", self.open_issues, self.confirmed_issues, self.unconfirmed_issues, self.feature_requests));
-        md.push_str(&format!("{} open PRs ({} ready for merge / {} draft)\n", self.open_pull_requests, self.ready_pull_requests, self.draft_pull_requests));
 
-        md.push_str("# Stats\n\nAll stats are displayed as:\n\n**Metric**: yesterday | last 7 days | last 30 days | last 365 days | all time.\n\n");
+        // Raw Stats
+        let mut md = String::from("# Raw Stats (Currently Open)\n\n");
+        md.push_str(&format!("* [{} Issues]({ISSUE_URL}) ([{} Confirmed Bugs]({ISSUE_URL}?q=is%3Aissue+is%3Aopen+label%3A\"status%3A+confirmed\") / [{} Unconfirmed Bugs]({ISSUE_URL}?q=is%3Aissue+is%3Aopen+label%3A\"status%3A+unconfirmed\") / [{} Feature Requests]({ISSUE_URL}?q=is%3Aissue+is%3Aopen+label%3Afeature-request))\n", self.open_issues, self.confirmed_issues, self.unconfirmed_issues, self.feature_requests));
+        md.push_str(&format!("* [{} Pull Requests]({PRS_URL}?q=is%3Apr+is%3Aopen) ([{} Ready for Review]({PRS_URL}?q=is%3Apr+is%3Aopen+draft%3Afalse) / [{} Draft]({PRS_URL}?q=is%3Apr+is%3Aopen+draft%3Atrue))\n", self.open_pull_requests, self.ready_pull_requests, self.draft_pull_requests));
+
+        // Stales
+        md.push_str("# Stales\n\n### [Pull Requests](https://github.com/rh-hideout/pokeemerald-expansion/pulls?q=is%3Apr+is%3Aopen+draft%3Afalse+sort%3Aupdated-asc)\n");
+        for stale_pr in self.stale_pull_requests.iter() {
+            md.push_str(&stale_pr.list_render());
+        }
+        md.push_str("### [Bugs](https://github.com/rh-hideout/pokeemerald-expansion/issues?q=is%3Aopen+sort%3Aupdated-asc)\n");
+        for stale_issue in self.stale_issues.iter() {
+            md.push_str(&stale_issue.list_render(false));
+        }
+
+        // Last Created
+        md.push_str(&format!("# Last Created\n\n### [Pull Requests]({PRS_URL}?q=is%3Apr+is%3Aopen+sort%3Acreated-desc)\n"));
+        for recent_pr in self.most_recent_pull_requests.iter() {
+            md.push_str(&recent_pr.list_render());
+        }
+        md.push_str(&format!("### [Issues]({ISSUE_URL}?q=is%3Aissue+is%3Aopen+sort%3Acreated-desc))\n"));
+        for recent_issue in self.most_recent_issues.iter() {
+            md.push_str(&recent_issue.list_render(false));
+        }
+        
+        // Parsed Stats
+        md.push_str("# Stats\n\nAll stats are displayed as:\n\n**Metric**: yesterday | last 7 days | last 30 days | last 365 days | all time.\n\nRate is \"For every X created, how many are completed?\". For example, 2 means \"For every bug that came in this month, we solved two of them\".\n\nGrowth is how many more of these occured in this time period. For example, -14 means \"This week we merged/closed 14 PRs\".\n\n");
 
         let yesterday_date_span = format!("{}", self.yesterday.date.unwrap());
         let last_7_days_date_span = format!("{l7}..{y}", y=self.yesterday.date.unwrap(), l7=self.last_week.date.unwrap());
@@ -274,22 +364,14 @@ impl GithubData {
                 self.last_year.opened_issues as i64 - self.last_year.closed_issues as i64,
                 self.all.opened_issues as i64 - self.all.closed_issues as i64,
             ));
-
         md
     }
 }
 
-static CREATED_STRING: &str = "+created%3A";
-static MERGED_STRING: &str = "+merged%3A";
-static CLOSED_STRING: &str = "+closed%3A";
-static PR_OPENED: &str = "https://github.com/rh-hideout/pokeemerald-expansion/pulls?q=is%3Apr+sort%3Aupdated-asc";
-static PR_MERGED: &str = "https://github.com/rh-hideout/pokeemerald-expansion/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-asc+draft%3Afalse";
-static ISSUE_OPENED: &str = "https://github.com/rh-hideout/pokeemerald-expansion/issues?q=is%253Aissue+sort%3Aupdated-asc";
-static ISSUE_CLOSED: &str = "https://github.com/rh-hideout/pokeemerald-expansion/issues?q=is%253Aissue+is%253Aclosed+sort%3Aupdated-asc";
-
 fn parse_issue(issue: Issue) -> ParsedIssue {
     ParsedIssue {
         user: issue.user.login.clone(),
+        id: issue.number,
         title: issue.title.clone(),
         state: issue.state,
         creation_date: issue.created_at,
@@ -303,6 +385,7 @@ fn parse_pr(pr: PullRequest) -> ParsedPR {
     //println!("{:#?}", pr);
     ParsedPR {
         user: pr.user.expect("Failed getting pr user").login,
+        id: pr.number,
         title: pr.title.expect("Failed getting pr title"),
         state: match pr.draft {
             Some(true) => PRState::Draft,
@@ -319,5 +402,19 @@ fn parse_pr(pr: PullRequest) -> ParsedPR {
         updated_date: pr.updated_at.expect("Failed getting pr update date"),
         closed_date: pr.closed_at,
         labels: pr.labels.expect("Failed getting pr labels")
+    }
+}
+
+fn parse_pr_from_issue(pr: Issue) -> ParsedPR {
+    ParsedPR {
+        user: pr.user.login,
+        id: pr.number,
+        title: pr.title,
+        state: PRState::Open,
+        open_state: pr.state,
+        creation_date: pr.created_at,
+        updated_date: pr.updated_at,
+        closed_date: pr.closed_at,
+        labels: pr.labels
     }
 }

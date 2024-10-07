@@ -1,61 +1,76 @@
 #[allow(dead_code)]
 mod github;
+mod utils;
 
-use std::{env, error::Error};
-
-//use chrono::Utc;
+use std::{env, sync::{atomic::{AtomicBool, Ordering}, Arc}, time::Duration};
 use dotenvy::dotenv;
-//use github::GithubData;
-use secrecy::Secret;
-use serenity::all::Client;
-use tokio_cron_scheduler::{/*JobBuilder,*/ JobScheduler};
+use github::GithubData;
+use serenity::{all::{ChannelId, Client, Context, EventHandler, GuildId, Message, Ready}, async_trait, Error};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let sched = JobScheduler::new().await.expect("Error starting job scheduler");
-    dotenv().expect(".env file not found");
+struct Handler {
+    is_loop_running: AtomicBool,
+}
 
-    octocrab::initialise(octocrab::Octocrab::builder()
-        .personal_token(Secret::new(env::var("GITHUB_TOKEN").expect("Expected a token in the environment")))
-        .build().unwrap()
-    );
+#[async_trait]
+impl EventHandler for Handler {
+    async fn message(&self, ctx: Context, msg: Message) {
+        if msg.content.starts_with("!ping") {
+            if let Err(why) = msg.channel_id.say(&ctx.http, "Pong!").await {
+                eprintln!("Error sending message: {why:?}");
+            }
+        }
+    }
 
-    /*sched.add(
-        JobBuilder::new()
-            .with_timezone(Utc)
-            .with_cron_job_type()
-            .with_schedule("0 * * * * *")
-            .unwrap()
-            .with_run_async(Box::new(|_uuid, mut _l| {
-                Box::pin(async move {
+    async fn ready(&self, _ctx: Context, ready: Ready) {
+        println!("{} is connected!", ready.user.name);
+    }
+
+    async fn cache_ready(&self, ctx: Context, _guilds: Vec<GuildId>) {
+        println!("Cache built successfully!");
+        let ctx = Arc::new(ctx);
+
+        if !self.is_loop_running.load(Ordering::Relaxed) {
+            let ctx1 = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                loop {
+                    println!("Starting loading GH data");
                     let mut github_data = GithubData::new();
                     github_data.fetch().await;
 
                     let output = github_data.render();
-                    if let Ok(gist_id) = env::var("GIST_ID") {
-                        octocrab::instance().gists()
-                            .update(gist_id)
-                            .description(format!("RHH Expansion Stats - {time}", time=chrono::offset::Utc::now()))
-                            .file("rhhstats.md")
-                            .with_content(output)
-                            .send().await.expect("Failed updating gist");
+                    println!("Github data loaded");
+
+                    let channel_id = ChannelId::new(875622508026544148);
+                    if let Err(why) = channel_id.say(&ctx1.http, &output).await {
+                        println!("Error sending message in channel: {:?}", why);
                     }
-                })
-            })).build().expect("Error creating fetch job")
-    ).await.expect("Error adding fetch job");*/
+                    tokio::time::sleep(Duration::from_secs(400)).await;
+                }
+            });
+            self.is_loop_running.swap(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    dotenv().expect(".env file not found");
+
+    octocrab::initialise(octocrab::Octocrab::builder()
+        .personal_token(env::var("GITHUB_TOKEN").expect("Expected a token in the environment"))
+        .build().unwrap()
+    );
 
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
     let intents = Default::default();
 
-    let mut client =
-        Client::builder(&token, intents).await.expect("Err creating client");
+    let mut client = Client::builder(&token, intents)
+        .event_handler(Handler {
+            is_loop_running: AtomicBool::new(false),
+        })
+        .await
+        .expect("Err creating client");
 
-    if let Err(why) = sched.start().await {
-        println!("Scheduler error: {why:?}");
-    };
-
-    if let Err(why) = client.start().await {
-        println!("Client error: {why:?}");
-    };
+    client.start().await?;
     Ok(())
 }
